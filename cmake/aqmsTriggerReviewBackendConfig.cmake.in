@@ -1,0 +1,20 @@
+# Time cmake module
+#
+# The following import targets are created
+#
+# ::
+#
+#   libaqmsTriggerReviewBackend-static
+#   libaqmsTriggerReviewBackend
+#
+# This module sets the following variables in your project::
+#
+#   aqmsTriggerReviewBackend_FOUND - true if aqmsTriggerReviewBackend library was found on the system
+#   aqmsTriggerReviewBackend_INCLUDE_DIR - the directory containing aqmsTriggerReviewBackend headers
+#   aqmsTriggerReviewBackend_LIBRARY - the aqmsTriggerReviewBackend library
+
+include(CMakeFindDependencyMacro)
+
+if (NOT TARGET aqmsTriggerReviewBackend::@PROJECT_NAME@)
+   include("${CMAKE_CURRENT_LIST_DIR}/@PROJECT_NAME@Targets.cmake")
+endif()

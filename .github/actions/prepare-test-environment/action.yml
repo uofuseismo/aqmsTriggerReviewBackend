@@ -1,0 +1,95 @@
+name: prepare-environment
+description: Prepares the test environment
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare environment
+      run: |
+        mkdir -p ${{github.workspace}}/build
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends \
+            tar \
+            wget \
+            cmake \
+            buildah \
+            ninja-build \
+            clang \
+            clang-tidy \
+            pkg-config \
+            build-essential
+      shell: bash
+
+    # The database suites need a real server rather than a stub: they run
+    # as the backend roles and assert on privilege errors, which is
+    # exactly what nothing but a real PostgreSQL will produce.  Version 18
+    # specifically, because that is what scripts/database targets.
+    - name: Install PostgreSQL 18
+      run: |
+        set -euo pipefail
+        if ! sudo apt-get install -y --no-install-recommends \
+                 postgresql-18 postgresql-client-18; then
+          echo "postgresql-18 is not in the distribution archive; adding PGDG"
+          sudo apt-get install -y --no-install-recommends curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-18 postgresql-client-18
+        fi
+      shell: bash
+
+    - name: Start PostgreSQL 18
+      run: |
+        set -euo pipefail
+        echo "Clusters before:"
+        pg_lsclusters
+
+        # The runner images ship a cluster of their own, sometimes of a
+        # different major version and often already holding 5432.  If one
+        # is left running, our 18 cluster is assigned some other port and
+        # the scripts - which use the default - would quietly talk to the
+        # wrong server.
+        pg_lsclusters --no-header | awk '$1 != "18" {print $1, $2}' \
+          | while read -r version cluster; do
+              echo "Stopping PostgreSQL ${version}/${cluster}"
+              sudo pg_ctlcluster "${version}" "${cluster}" stop || true
+            done
+
+        if ! pg_lsclusters --no-header | awk '{print $1"/"$2}' \
+             | grep -qx "18/main"; then
+          sudo pg_createcluster 18 main
+        fi
+
+        sudo pg_conftool 18 main set port 5432
+        sudo pg_ctlcluster 18 main start \
+          || sudo pg_ctlcluster 18 main restart
+
+        # The suites connect the test roles over TCP to localhost, because
+        # a unix-socket connection lands on peer authentication - which
+        # maps to the OS user and cannot authenticate as a test role
+        # whatever password it is given.  The Debian default pg_hba
+        # already covers this; make sure of it rather than discovering it
+        # as a peer-auth failure halfway through a run.
+        HBA=$(sudo -u postgres psql -Atc "SHOW hba_file")
+        echo "hba_file is ${HBA}"
+        if ! sudo grep -Eq '^host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32' "${HBA}"; then
+          echo "Adding a scram-sha-256 line for 127.0.0.1/32"
+          echo "host    all    all    127.0.0.1/32    scram-sha-256" \
+            | sudo tee -a "${HBA}"
+          sudo pg_ctlcluster 18 main reload
+        fi
+
+        for _ in $(seq 1 30); do
+          if pg_isready -h localhost -p 5432; then break; fi
+          sleep 1
+        done
+        pg_isready -h localhost -p 5432
+
+        echo "Clusters after:"
+        pg_lsclusters
+        sudo -u postgres psql -Atc "SELECT version();"
+      shell: bash

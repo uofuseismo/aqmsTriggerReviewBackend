@@ -1,0 +1,20 @@
+# Purpose: Creates the container for running the aqmsTriggerReviewBackend software
+#          in a Ubuntu container.
+# Usage: podman build -t aqmstriggerreviewbackender:latest -f Dockerfile.u24
+#        buildah bud -t aqmstriggerreviewbackender:latest -f Dockerfile.u24
+FROM ubuntu:24.04
+COPY @PROJECT_NAME@-@PROJECT_VERSION@-Linux.tar.gz .
+LABEL version="@PROJECT_VERSION@"
+RUN apt-get update &&\
+    apt-get upgrade -y &&\
+    apt-get autoremove -y &&\
+    apt-get autoclean -y &&\
+    apt-get -y install bash &&\
+    apt-get autoremove -y &&\
+    apt-get clean &&\
+    tar -xf ./@PROJECT_NAME@-@PROJECT_VERSION@-Linux.tar.gz &&\
+    mv ./@PROJECT_NAME@-@PROJECT_VERSION@-Linux/bin/aqmsTriggerReviewBackend /usr/local/bin &&\
+    rm -r ./@PROJECT_NAME@-@PROJECT_VERSION@-Linux/ &&\
+    rm -r /var/lib/apt/lists/* ./@PROJECT_NAME@-@PROJECT_VERSION@-Linux.tar.gz
+
+#CMD /usr/local/bin/aqmsTriggerReviewBackend --config=config.ini

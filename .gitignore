@@ -1,0 +1,17 @@
+CMakeUserPresets.json
+setupDebug.sh
+version.hpp
+trp.ini
+build
+runIt.sh
+files.zip
+.claude/settings.local.json
+a.out
+curlWaveforms.sh
+attic
+
+# Contact lists hold personal phone numbers; deployments supply their own.
+testing/data/callList/
+
+# Local run directory: config with credentials and the JWT signing keys.
+run/

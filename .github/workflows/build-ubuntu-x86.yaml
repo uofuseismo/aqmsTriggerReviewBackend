@@ -1,0 +1,255 @@
+name: AQMS Trigger Review Backend Application
+run-name: Pipeline for branch ${{ github.ref_name }}
+
+on:
+  push:
+    branches: [main]
+  # Rebuilds on an unchanged tree so the image picks up base-image
+  # security updates.  FROM ubuntu:26.04 re-resolves and apt-get upgrade
+  # runs on a fresh runner with no layer cache, so this is a real rebuild.
+  schedule:
+    # Off the hour deliberately - scheduled runs queue heavily at :00.
+    # UTC.  Note GitHub disables scheduled workflows after 60 days with
+    # no repository activity, and emails the owner when it does.
+    - cron: '17 9 * * *'
+  # A manual trigger, for when the registry was down rather than the code
+  # being wrong.
+  workflow_dispatch:
+  #pull_request:
+  #  branches: [main]
+
+# One pipeline at a time.  Not cancel-in-progress: a run that is already
+# pushing should finish rather than leave a tag half-written.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_NAME: AQMSTriggerReviewBackend
+  CONTAINER_NAME: aqmstriggerreviewbackend
+  QUAY_DIRECTORY: aqmstriggerreviewbackend
+  BUILD_TYPE: Release
+  CXX: /usr/bin/clang++
+  CC: /usr/bin/clang
+
+jobs:
+  build:
+    runs-on: ${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-26.04]
+        arch: [x86]
+        BUILD_TARGET: [Release]
+    name: Build for ${{ matrix.distro }} ${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v6
+      # Trick next step - python checkout wants a requirements.txt file
+      - run: touch requirements.txt
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+      - run: pip install conan
+
+      - name: Conan cache setup
+        uses: actions/cache@v5
+        id: cache-conan
+        env:
+          cache-name: cache-conan-modules
+        with:
+          path: ~/.conan2
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('./conanfile.py') }}
+
+      # Cache hit
+      - if: ${{ steps.cache-conan.outputs.cache-hit == 'true' }}
+        name: Cache hit - list the existing Conan modules
+        continue-on-error: true
+        run: |
+          ls ~/.conan2/
+          ls ~/.conan2/p
+
+      - name: Create default profile with Ninja generator
+        run: |
+          conan profile detect -f
+          echo "" >> ~/.conan2/profiles/default
+          echo "[conf]" >> ~/.conan2/profiles/default
+          echo "tools.cmake.cmaketoolchain:generator=Ninja" >> ~/.conan2/profiles/default
+          #echo "tools.build:cflags=[\"-mach=x86-64-v2\"]" >> ~/.conan2/profiles/default
+          #echo "tools.build:cxxflags=[\"-march=x86-64-v2\"]" >> ~/.conan2/profiles/default
+          #tail -n 10 ~/.conan2/profiles/default
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build-environment
+
+      - name: libmseed cache setup
+        uses: actions/cache@v5
+        id: cache-libmseed
+        env:
+          cache-name: cache-libmseed-libraries
+        with:
+          path: |
+             ${HOME}/third-party/include/libmseed.h
+             ${HOME}/third-party/lib/cmake/libmseed/*
+             ${HOME}/third-party/lib/libmseed.a
+          key: ${{ matrix.distro }}-${{ matrix.arch }}-build-${{ env.cache-name }}-${{ hashFiles('${HOME}/third-party') }}$ 
+
+      - if: ${{ steps.cache-libmseed.outputs.cache-hit == 'true' }}
+        name: Show existing libmseed
+        continue-on-error: true
+        run: |
+          ls ${HOME}/third-party/include
+          ls ${HOME}/third-party/lib
+      - if: ${{ steps.cache-libmseed.outputs.cache-hit != 'true' }}
+        name: Build libmseed
+        run: |
+          mkdir -p ${HOME}/third-party
+          wget https://github.com/EarthScope/libmseed/archive/refs/tags/v3.5.4.tar.gz
+          tar -xf v3.5.4.tar.gz
+          rm v3.5.4.tar.gz
+          cd libmseed-3.5.4
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DBUILD_STATIC_LIBS=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=${HOME}/third-party
+          cmake --build build
+          cmake --install build
+          cd ../
+          rm -rf libmseed-3.5.4
+
+      - name: Copy libmseed
+        run: |
+          sudo mkdir -p /usr/local/lib/
+          sudo mkdir -p /usr/local/include/
+          sudo cp -r ${HOME}/third-party/lib/cmake* /usr/local/lib/
+          sudo cp ${HOME}/third-party/lib/*.a /usr/local/lib/
+          sudo cp ${HOME}/third-party/include/*.h /usr/local/include/
+
+      - name: Install Conan dependencies
+        working-directory: ${{github.workspace}}
+        run: "conan install . --build=missing -s:a build_type=${{env.BUILD_TYPE}} -s:a compiler=clang -s:a compiler.version=20 -s:a compiler.cppstd=23 -s:a compiler.libcxx=libstdc++11 --output-folder ."
+
+      - name: Configure preset and build
+        working-directory: ${{github.workspace}}
+        run: |
+           cmake --preset conan-release -DENABLE_SSL=ON -DENABLE_COMPRESSION=ON -DWITH_CONAN=ON -DBUILD_CONTAINER=ON
+           cmake --build --preset conan-release
+           cp include/aqmsTriggerReviewBackend/version.hpp build
+           cp CMakeUserPresets.json build
+
+      - name: Upload build directory
+        uses: ./.github/actions/upload-build-directory
+
+  test:
+    needs: build
+    runs-on: ${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-26.04]
+        arch: [x86]
+    name: Test on ${{ matrix.distro }} ${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare test environment
+        uses: ./.github/actions/prepare-test-environment
+
+      # Runs before the build artifacts are unpacked because it does not
+      # need them: a regression in the SQL fails here rather than after a
+      # download.  test.sh builds a throwaway database, runs both suites
+      # against it as the backend roles, and drops it again.
+      - name: Run database tests
+        working-directory: ${{github.workspace}}
+        env:
+          TEST_DB: ${{ vars.CI_TEST_DB || 'aqmsdb_selftest' }}
+        run: |
+          set -euo pipefail
+          # psql runs \i as the postgres user, and that user cannot read
+          # the workspace under /home/runner.  Stage the scripts where it
+          # can - the same reason the README says not to run them out of
+          # a home directory.
+          sudo install -d -m 755 /usr/local/share/aqmsdb
+          sudo cp scripts/database/*.sql scripts/database/*.sh \
+                  /usr/local/share/aqmsdb/
+          sudo chmod 755 /usr/local/share/aqmsdb/*.sh
+          sudo chmod 644 /usr/local/share/aqmsdb/*.sql
+          cd /usr/local/share/aqmsdb
+          sudo -u postgres --preserve-env=TEST_DB ./test.sh
+
+      - name: Download build directory
+        uses: ./.github/actions/download-build-directory
+
+      - name: Run unit tests for release
+        working-directory: ${{github.workspace}}
+        run: |
+          mv build/version.hpp include/aqmsTriggerReviewBackend/
+          mv build/CMakeUserPresets.json ./
+          ctest --preset conan-release --verbose
+
+  package:
+    needs: test
+    runs-on: ${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-26.04]
+        arch: [x86]
+        BUILD_TARGET: [Release]
+    name: Package for ${{ matrix.distro }} ${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare package environment
+        uses: ./.github/actions/prepare-package-environment
+
+      - name: Download build directory
+        uses: ./.github/actions/download-build-directory
+
+      - name: Package tgz
+        working-directory: ${{github.workspace}}
+        run: |
+          mv build/version.hpp include/aqmsTriggerReviewBackend/
+          mv build/CMakeUserPresets.json ./
+          cd build/Release
+          mkdir -p artifacts
+          cpack -B artifacts TGZ
+
+      - name: Build and push image
+        env: # Or as an environment variable
+          QUAY_ROBOT_PASSWORD: ${{ secrets.QUAY_ROBOT_PASSWORD }}
+          QUAY_ROBOT_USER: ${{ secrets.QUAY_ROBOT_USER }}
+        working-directory: ${{github.workspace}}
+        run: |
+          echo $QUAY_ROBOT_PASSWORD | buildah login -u $QUAY_ROBOT_USER --password-stdin quay.io
+          cd build/Release
+          cp artifacts/*tar.gz ./
+          version=$(ls *tar.gz | sed 's/aqmsTriggerReviewBackend-//g' | sed 's/-Linux.tar.gz//g')
+          echo "Will build container version ${version}"
+          buildah bud -t ${CONTAINER_NAME}:${version} -t ${CONTAINER_NAME}:latest -f ./Dockerfile.u26
+          # Two names for one image.  The plain version tag is what the
+          # Deployment references and what imagePullPolicy: Always
+          # follows; the dated one never appears in a manifest and exists
+          # so a running pod's digest can be traced to a build, and so
+          # yesterday's image is still reachable if a base update breaks
+          # something.
+          dated="${version}-$(date -u +%Y%m%d)"
+          buildah tag ${CONTAINER_NAME}:${version} quay.io/uuss/${QUAY_DIRECTORY}:${version}
+          buildah tag ${CONTAINER_NAME}:${version} quay.io/uuss/${QUAY_DIRECTORY}:${dated}
+          # Retry a transient registry failure, but FAIL the step when
+          # every attempt fails.  A loop that just falls through leaves a
+          # green pipeline and a stale tag in the registry, which looks
+          # exactly like a working deploy until something reads the
+          # binary.
+          push_tag() {
+            for i in 1 2 3; do
+              buildah push "$1" && return 0
+              echo "Push of $1 failed (attempt $i); retrying"
+              sleep 15
+            done
+            echo "ERROR: could not push $1 after 3 attempts"
+            return 1
+          }
+          push_tag quay.io/uuss/${QUAY_DIRECTORY}:${version}
+          push_tag quay.io/uuss/${QUAY_DIRECTORY}:${dated}
+
