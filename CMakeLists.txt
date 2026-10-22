@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(aqmsTriggerReviewBackend VERSION 0.1.0 LANGUAGES CXX)
+project(aqmsTriggerReviewBackend VERSION 0.1.1 LANGUAGES CXX)
 enable_testing()
 
 option(BUILD_SHARED_LIBS "Build using shared libraries" OFF)
@@ -248,6 +248,7 @@ if (PROJECT_IS_TOP_LEVEL AND ${BUILD_TESTS})
        testing/database/credentials.cpp
        testing/secretFile.cpp
        testing/routeCatalog.cpp
+       testing/describeClient.cpp
        testing/auth/authenticator.cpp
        testing/auth/authNZ.cpp
        testing/auth/authorization.cpp
@@ -264,6 +265,7 @@ if (PROJECT_IS_TOP_LEVEL AND ${BUILD_TESTS})
                          PRIVATE
                             aqmsTriggerReviewBackend::libaqmsTriggerReviewBackend
                             spdlog::spdlog_header_only
+                            Crow::Crow
                             Threads::Threads
                             Catch2::Catch2 Catch2::Catch2WithMain)
    target_include_directories(unitTests

@@ -1,5 +1,6 @@
 #ifndef AQMS_TRIGGER_REVIEW_BACKEND_AUTHORIZE_ROUTE_HPP
 #define AQMS_TRIGGER_REVIEW_BACKEND_AUTHORIZE_ROUTE_HPP
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -23,6 +24,45 @@
 
 namespace
 {
+
+/// @brief Who sent a request, as the proxies in front of us tell it.
+/// @result client=, forwarded= and request= fields for a log line, with
+///         "-" for any header that is absent.
+/// @note X-Real-IP is the one to believe.  The ingress sets it after
+///       deciding which hops to trust, while the front of X-Forwarded-For
+///       is whatever the caller chose to send - so the latter is logged
+///       for tracing, never relied on.  None of this is fit for
+///       authorization.
+/// @note Each value is truncated: these are caller-controlled strings
+///       going into the log.
+[[nodiscard]] std::string describeClient(const crow::request &request) noexcept
+{
+    const auto header = [&request](const char *name) -> std::string
+    {
+        constexpr std::size_t maximumLength{128};
+        try
+        {
+            auto value = request.get_header_value(name);
+            if (value.empty()){return "-";}
+            if (value.size() > maximumLength){value.resize(maximumLength);}
+            return value;
+        }
+        catch (...)
+        {
+            return "-";
+        }
+    };
+    try
+    {
+        return "client=" + header("X-Real-IP")
+             + " forwarded=\"" + header("X-Forwarded-For") + "\""
+             + " request=" + header("X-Request-ID");
+    }
+    catch (...)
+    {
+        return "client=-";
+    }
+}
 
 /// @brief The Crow half of the per-request check: what a route handler
 ///        gets back from ::authorizeRoute.
@@ -267,7 +307,8 @@ void setChallenge(crow::response &response,
             = authNZ.login(std::pair {user, credential->password});
         if (authResult == Auth::IAuthenticator::Result::Authenticated)
         {
-            SPDLOG_LOGGER_INFO(logger, "{} logged in", user);
+            SPDLOG_LOGGER_INFO(logger, "{} logged in {}",
+                               user, ::describeClient(request));
             boost::json::object data;
             data["jwt"] = std::move(jwt);
             return ::makeDataResponse(200,
@@ -283,7 +324,8 @@ void setChallenge(crow::response &response,
             // which of the user name or the password was wrong - that
             // difference is what lets someone enumerate accounts.
             SPDLOG_LOGGER_WARN(logger,
-                               "{} rejected - invalid credentials", user);
+                               "{} rejected - invalid credentials {}",
+                               user, ::describeClient(request));
             return refuse("Invalid credentials - double check "
                           "user/password");
         }
@@ -389,10 +431,12 @@ void setChallenge(crow::response &response,
     const auto verdict = authNZ.authorize(authorization, requirement);
     if (verdict.isAllowed())
     {
-        SPDLOG_LOGGER_DEBUG(logger, "Verified {} for route {}",
-                            verdict.identity ? verdict.identity->user
-                                             : std::string {"unknown"},
-                            route);
+        // One line per authorized request, carrying who and from where -
+        // the request ID is what ties it to the proxies' access logs.
+        SPDLOG_LOGGER_INFO(logger, "{} on route {} {}",
+                           verdict.identity ? verdict.identity->user
+                                            : std::string {"unknown"},
+                           route, ::describeClient(request));
         return RouteAuthorization {verdict.identity, std::nullopt};
     }
 
@@ -404,13 +448,14 @@ void setChallenge(crow::response &response,
     // not be.
     if (verdict.status == Auth::Authorization::Status::ServerError)
     {
-        SPDLOG_LOGGER_ERROR(logger, "Authorization failed on route {}: {}",
-                            route, verdict.reason);
+        SPDLOG_LOGGER_ERROR(logger, "Authorization failed on route {}: {} {}",
+                            route, verdict.reason, ::describeClient(request));
     }
     else
     {
-        SPDLOG_LOGGER_WARN(logger, "Authorization denied ({}) on route {}: {}",
-                           statusCode, route, verdict.reason);
+        SPDLOG_LOGGER_WARN(logger, "Authorization denied ({}) on route {}: {} {}",
+                           statusCode, route, verdict.reason,
+                           ::describeClient(request));
     }
     return RouteAuthorization
            {std::nullopt,
